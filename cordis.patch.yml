@@ -1,0 +1,7 @@
+# dsh-session-handoff bundle patch - mounts the session handoff plugin as a
+# profile layer. The insert id matches the plugin package name so
+# `dsh plugin add dsh-session-handoff` resolves and the three-piece gate
+# (check-plugin-ready.mjs) passes.
+- insert:
+  - id: dsh-session-handoff
+    name: 'dsh-session-handoff'
