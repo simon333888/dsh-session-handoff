@@ -762,7 +762,7 @@ class MenuInjector {
 // ---------------------------------------------------------------------------
 export function apply(ctx: ClientCtx): void {
   // 版本自报 + ctx 服务面自检（排查 sessions/workspaces 未注入类问题）
-  console.info('[session-handoff] client v0.2.5 loaded; ctx: slots=' + (ctx.slots !== undefined)
+  console.info('[session-handoff] client v0.2.6 loaded; ctx: slots=' + (ctx.slots !== undefined)
     + ' sessions=' + (ctx.sessions !== undefined) + ' workspaces=' + (ctx.workspaces !== undefined))
   // v0.2.4：编排器/注入器为页面级单例——移交会触发"对话视图→新会话 hero"的组件卸载，
   // 若状态活在槽位 useEffect 内，startSession 后即被 cleanup 杀死（面包屑实证：
