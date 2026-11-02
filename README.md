@@ -12,7 +12,8 @@ dsh plugin --profile web add dsh-session-handoff
 ```
 
 Web profile 重启（或在 dshmarket 中启用）后生效；浏览器 Console 出现
-`[dsh-session-handoff] v0.2.5` 版本行即加载成功。
+`[session-handoff] client v0.2.6 loaded; ctx: slots=true sessions=true workspaces=true`
+版本行即加载成功（菜单注入成功时还会打印一条 `menu: 已注入「移交会话」`）。
 
 > Session handoff for DeepSeek Harness: the session row "..." menu gains
 > *Hand off session* - one click creates a successor session that rebuilds
@@ -63,6 +64,14 @@ DSH_CHECKOUT=D:/deepseek-harness npm run build   # tsc（host 半）+ tsdown（c
 单向迁移（registry 移除 → profile bundles 加入）。宿主版本 pin 0.1.1-rc.2。
 
 
+## 本机适配（readback 路径）
+
+接手提示里带一条 readback 命令，路径取自 `src/client/index.ts` 顶部的 `READBACK` 常量
+（默认是作者本机的绝对路径）。装到别的机器时请改成自己插件目录下的
+`.../plugins/dsh-session-handoff/scripts/readback.py`，否则新会话回溯旧会话时会报路径不存在；
+也可以只改构建产物 `lib/client.js` 里的同一个常量，不必重新构建。
+
+
 ## 已知边界（实测沉淀）
 
 - **看门狗随发起页存活**：关闭发起移交的浏览器页会停掉看门狗（agent 本身继续跑完，但无自动判定/超时取消）——移交发起后别关该页；
@@ -72,4 +81,9 @@ DSH_CHECKOUT=D:/deepseek-harness npm run build   # tsc（host 半）+ tsdown（c
 
 ## 版本履历
 
+- 0.2.6 会话行定位改按触发钮归属判定（工作区菜单同样含「归档会话」文案）→ 会话 id 走
+  data-row-key，建会话改用 sessions.create + uiWorkspace.openSession（宿主 startSession 会
+  复用空白会话，等于不新建）→ 落位判定改 mainReference（sessions.list.current 恒为 null）
+  → 输入框兼容 Lexical contenteditable + 草稿按长度判定 → 菜单项加绿色图标（不再继承
+  「删除会话」的 danger 红）
 - 0.1.0 首版（纯 DOM，被注入器骨架校验拒收）→ 0.1.1 slot 壳合规 → 0.1.2 两阶段提交修复（空草稿发送钮 disabled）→ 0.2.0 预设选择（方案 B）→ 0.2.1 版本自报日志 → 0.2.2 面包屑诊断 → 0.2.3 工作区解析三级回退 → 0.2.4 页面级单例（视图切换死亡修复）→ 0.2.5 安静日志 + 协议命令加固

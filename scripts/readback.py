@@ -31,7 +31,7 @@ except ImportError:
     sys.exit(2)
 
 DSH_SESSIONS = os.path.join(os.path.expanduser("~"), ".dsh", "sessions")
-SID_RE = re.compile(r"^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+SID_RE = re.compile(r"^(?:session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HANDOFF_DIR_RE = re.compile(r"handoff-\d{8}-\d{6}$")
 SECTIONS = [
     "01-identity.md", "02-rules.md", "03-tasks.md", "04-facts.md",
@@ -44,7 +44,9 @@ def resolve_session_file(sid: str) -> str:
     if not SID_RE.match(sid):
         print(f"[readback] 非法 session-id: {sid!r}", file=sys.stderr)
         sys.exit(2)
-    hits = glob.glob(os.path.join(DSH_SESSIONS, "*", sid, "session.jsonl.zstd"))
+    hits = []
+    for name in ("session.v4.jsonl.zstd", "session.jsonl.zstd"):
+        hits.extend(glob.glob(os.path.join(DSH_SESSIONS, "*", sid, name)))
     if not hits:
         print(f"[readback] 未找到会话文件（检查 id）: {sid}", file=sys.stderr)
         sys.exit(3)
@@ -69,10 +71,20 @@ def load_events(sid: str):
 
 
 def text_of(ev: dict) -> str:
-    """user/assistant 消息 → 纯文本；其他事件 → 空。"""
+    """user/assistant 消息 → 纯文本；其他事件 → 空。
+
+    兼容两种落盘结构：
+      - user/message:      data.content = [ {type:"text", ...}, ... ]
+      - assistant/message: data.message.content = [ {type:"reasoning"|"text", ...} ]
+    只取 type=="text" 的块（reasoning 内容不进入交接包）。
+    """
     data = ev.get("data") or {}
+    blocks = data.get("content")
+    if not isinstance(blocks, list):
+        msg = data.get("message")
+        blocks = msg.get("content") if isinstance(msg, dict) else None
     parts = []
-    for c in data.get("content") or []:
+    for c in blocks or []:
         if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
             parts.append(str(c["text"]))
     return "\n".join(parts)

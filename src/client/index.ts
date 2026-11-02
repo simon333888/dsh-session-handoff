@@ -34,6 +34,11 @@ const SUCCESS_MARKER = '我已经成功接替了工作，请指示。'
 const FAIL_MARKER = '工作交接失败'
 const MANIFEST_TAG = 'HANDOFF-MANIFEST:'
 const ITEM_FLAG = 'data-dsh-handoff'
+/** 菜单项强调色（绿色；浅/深主题下均清晰，不继承删除项的危险红） */
+const HANDOFF_COLOR = '#16a34a'
+/** 「移交会话」图标：双向箭头（会话交接） */
+const HANDOFF_ICON =
+  '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 5.5h9"/><path d="M8.5 3 11 5.5 8.5 8"/><path d="M14 10.5H5"/><path d="M7.5 8 5 10.5 7.5 13"/></svg>'
 const WATCHDOG_MS = 10 * 60 * 1000
 const MENU_POLL_MS = 400
 /** 会话菜单语义锚（zh/en 双语；宿主升级改文案 → 菜单项缺席即 fail-soft 降级） */
@@ -49,6 +54,8 @@ interface SessionInfo {
 interface SessionsPort {
   list?: { getSnapshot?: () => { byId?: Record<string, SessionInfo>; current?: string } }
   noteAgentPreset?: (id: string, preset: string) => void
+  /** 不带 sessionId 时强制新建空会话（宿主 0.2.x 实测） */
+  create?: (request: { workspaceId: string; agentPreset?: string }) => Promise<unknown> | unknown
 }
 interface WorkspacesPort {
   startSession?: (workspaceId?: string) => void
@@ -62,12 +69,26 @@ interface ClientCtx {
   sessions?: SessionsPort
   workspaces?: WorkspacesPort
   slots?: SlotsPort
+  /** 宿主 0.2.x 的建会话/切主视图服务（workspaces 服务本身没有 startSession） */
+  uiWorkspace?: UiWorkspacePort
+  get?: (name: string) => unknown
+}
+interface UiWorkspacePort {
+  mainReference?: { sessionId?: string }
+  openSession?: (sessionId: string) => void
+  startSession?: (workspaceId?: string) => void
 }
 
 // ---------------------------------------------------------------------------
 // 会话身份解析：React fiber 精确路径优先，aria 标题 → 会话清单匹配兜底
 // ---------------------------------------------------------------------------
 function fiberSessionIdOf(el: HTMLElement): string | undefined {
+  // 宿主 0.2.x：会话行带 data-row-key="session:<id>"，比 fiber 遍历稳（fiber 上已无 node/session 属性）
+  try {
+    const rowKey = el.closest?.('[data-row-key]')?.getAttribute('data-row-key') ?? ''
+    const fromRow = rowKey.match(/^session:(.+)$/)?.[1]
+    if (typeof fromRow === 'string' && fromRow !== '') return fromRow
+  } catch { /* fail-soft：继续走 fiber */ }
   try {
     const key = Object.keys(el).find((k) => k.startsWith('__reactFiber$'))
     if (!key) return undefined
@@ -180,12 +201,27 @@ class Orchestrator {
     this.running = false
   }
 
+  /** 当前主会话 id：uiWorkspace.mainReference 为准，sessions.list.current 仅兜底（该字段在 0.2.x 恒为 null）。 */
+  private mainSessionId(): string | undefined {
+    const c = this.ctx
+    try {
+      const svc = (c.uiWorkspace ?? c.get?.('uiWorkspace')) as UiWorkspacePort | undefined
+      const id = svc?.mainReference?.sessionId
+      if (typeof id === 'string' && id !== '') return id
+    } catch { /* fail-soft */ }
+    try {
+      const cur = c.sessions?.list?.getSnapshot?.().current
+      if (typeof cur === 'string' && cur !== '') return cur
+    } catch { /* fail-soft */ }
+    return undefined
+  }
+
   run(trigger: { el?: HTMLElement; aria?: string }): void {
     if (this.running) { toast('移交会话：已有一次移交在进行中，请等待其完成'); return }
     const c = this.ctx
     const oldId = (trigger.el ? fiberSessionIdOf(trigger.el) : undefined)
       ?? sessionIdByTitle(c, titleFromAria(trigger.aria ?? ''))
-      ?? c.sessions?.list?.getSnapshot?.().current
+      ?? this.mainSessionId()
     console.info('[session-handoff] run: click → oldId=' + (oldId ?? 'null')
       + ' via=' + (trigger.el && fiberSessionIdOf(trigger.el) ? 'fiber' : trigger.aria ? 'aria' : 'current'))
     if (!oldId) { toast('移交会话：无法确定要移交的会话（结构探测失败）'); return }
@@ -218,6 +254,19 @@ class Orchestrator {
     let chipBaseText: string | null = null
     let banner: Banner | null = null
     let done = false
+    let creating = false
+    let newSessionId: string | null = null
+    /** 建会话/切主视图：uiWorkspace 优先，workspaces 兜底 */
+    const uiNav = (): UiWorkspacePort | WorkspacesPort | undefined => {
+      let svc: UiWorkspacePort | undefined
+      try { svc = c.uiWorkspace } catch { svc = undefined }
+      if (svc !== undefined && typeof svc.openSession === 'function') return svc
+      try {
+        const viaGet = c.get?.('uiWorkspace') as UiWorkspacePort | undefined
+        if (viaGet !== undefined && typeof viaGet.openSession === 'function') return viaGet
+      } catch { /* fail-soft */ }
+      return svc ?? c.workspaces
+    }
 
     /** 工作区解析（三级回退）：sessionIds 精确归属 → path/cwd 与老会话 cwd 匹配（防御式探测）→ 失败明确报错。 */
     const resolveWsId = (): string | undefined => {
@@ -272,9 +321,26 @@ class Orchestrator {
         if (phase === 'resolve-ws') {
           const wsId = resolveWsId()
           if (wsId !== undefined) {
-            console.info('[session-handoff] select: wsId=' + wsId + ' → startSession')
-            c.workspaces?.startSession?.(wsId)
-            phase = 'find-chip'
+            if (!creating) {
+              // 宿主 startSession 会复用当前空白会话（等价于不新建），改为显式 create 再切主视图
+              creating = true
+              Promise.resolve()
+                .then(() => c.sessions?.create?.({ workspaceId: wsId }))
+                .then((created) => {
+                  const asRec = created as { sessionId?: string; id?: string } | undefined
+                  const id = typeof created === 'string'
+                    ? created
+                    : (asRec?.sessionId ?? asRec?.id)
+                  if (typeof id !== 'string' || id === '') throw new Error('sessions.create 未返回会话 id')
+                  newSessionId = id
+                  console.info('[session-handoff] select: 新会话 ' + id + ' 已创建 → openSession')
+                  const nav = uiNav()
+                  if (typeof nav?.openSession === 'function') nav.openSession(id)
+                  else if (typeof nav?.startSession === 'function') nav.startSession(wsId)
+                  phase = 'find-chip'
+                })
+                .catch((e: unknown) => cancel('创建新会话失败：' + String((e as Error)?.message ?? e).slice(0, 120)))
+            }
           } else {
             const items = c.workspaces?.list?.getSnapshot?.().items ?? []
             if (Math.round((Date.now() - started) / 5000) % 3 === 0) {
@@ -286,7 +352,7 @@ class Orchestrator {
           }
           return
         }
-        const newId = c.sessions?.list?.getSnapshot?.().current
+        const newId = newSessionId ?? this.mainSessionId()
         if (!newId || newId === oldId) {
           if (Math.round((Date.now() - started) / 5000) % 6 === 0) {
             console.debug('[session-handoff] select: 等待新会话落位（current=' + (newId ?? 'null').slice(0, 20) + '）')
@@ -356,8 +422,7 @@ class Orchestrator {
 
     const tick = window.setInterval(() => {
       try {
-        const snap = c.sessions?.list?.getSnapshot?.()
-        const newId = snap?.current
+        const newId = this.mainSessionId()
         // ① 新会话就位：尽力 note 预设（B 尽力语义）
         if (!presetNoted && newId && newId !== oldId) {
           presetNoted = true
@@ -371,15 +436,15 @@ class Orchestrator {
           if (!ta) {
             if (Date.now() - started > 60000) { stop(false, '60 秒内未找到新会话输入框'); return }
           } else if (phase === 'draft') {
-            if (ta.value !== prompt) {
-              const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
-              setter?.call(ta, prompt)
-              ta.dispatchEvent(new Event('input', { bubbles: true }))
+            // Lexical 的 innerText 与原文换行有差异，逐字比对永远不相等 → 只按长度判断草稿是否就位
+            if (this.composerText(ta).length < 20) {
+              this.setComposerText(ta, prompt)
             } else {
               // 草稿已写入且发送钮已激活 → 点击
               const btn = this.findSendButton()
               if (btn && !btn.disabled && clickTries < 5) {
                 clickTries += 1
+                try { ta.focus() } catch { /* fail-soft */ }
                 btn.click()
                 phase = 'sent'
               } else if (btn && !btn.disabled && clickTries >= 5) {
@@ -387,7 +452,7 @@ class Orchestrator {
               }
             }
           } else if (phase === 'sent') {
-            if (ta.value === '') { phase = 'done' } // 草稿被清空 = 消息已进入管线
+            if (this.composerText(ta).length < 20) { phase = 'done' } // 草稿被清空 = 消息已进入管线
             else if (Date.now() - started > 90000) { stop(false, '消息未能发出（草稿未清空）'); return }
           }
         }
@@ -428,14 +493,48 @@ class Orchestrator {
     this.timers.push(tick)
   }
 
-  /** composer 定位：发送钮同容器内的 textarea（无发送钮时回退全页唯一 textarea）。 */
-  private findComposer(): HTMLTextAreaElement | null {
+  /** composer 定位：textarea 优先；新版宿主用 Lexical，输入框是 contenteditable 的 [role=textbox]。 */
+  private findComposer(): HTMLElement | null {
     try {
-      const btn = this.findSendButton()
-      const holder = btn?.closest('form, div')
-      const ta = (holder?.querySelector('textarea') ?? document.querySelector('textarea')) as HTMLTextAreaElement | null
-      return ta && !ta.disabled ? ta : null
+      const ta = document.querySelector('textarea:not([disabled])') as HTMLTextAreaElement | null
+      if (ta) return ta
+      const ed = document.querySelector(
+        '[contenteditable="true"], [contenteditable=""], [role="textbox"]',
+      ) as HTMLElement | null
+      if (ed && ed.getAttribute('aria-disabled') !== 'true') return ed
+      return null
     } catch { return null }
+  }
+
+  /** 读取草稿文本（textarea 取 value；contenteditable 取 innerText，去零宽字符）。 */
+  private composerText(el: HTMLElement): string {
+    const v = (el as HTMLTextAreaElement).value
+    if (typeof v === 'string') return v
+    return String(el.innerText ?? el.textContent ?? '').replace(/\u200b/g, '').trim()
+  }
+
+  /** 写入草稿：textarea 走原生 setter + input；contenteditable 走选区 + execCommand（Lexical 认这条）。 */
+  private setComposerText(el: HTMLElement, text: string): void {
+    const ta = el as HTMLTextAreaElement
+    if (typeof ta.value === 'string') {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
+      setter?.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+      return
+    }
+    try { el.focus() } catch { /* fail-soft */ }
+    try {
+      const range = document.createRange()
+      range.selectNodeContents(el)
+      const sel = window.getSelection()
+      sel?.removeAllRanges()
+      sel?.addRange(range)
+      document.execCommand('insertText', false, text)
+    } catch { /* 落到下面的回退 */ }
+    if (this.composerText(el).length < 10) {
+      el.textContent = text
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }))
+    }
   }
 
   private findSendButton(): HTMLButtonElement | null {
@@ -559,7 +658,7 @@ class Banner {
 // MenuInjector：轻量轮询（不监听 body subtree——2026-09-02 turn-nav 教训）
 // ---------------------------------------------------------------------------
 class MenuInjector {
-  private lastTrigger: { el?: HTMLElement; aria?: string; at: number } = { at: 0 }
+  private lastTrigger: { el?: HTMLElement; aria?: string; at: number; isSession?: boolean } = { at: 0 }
   private timer: number | undefined
   private onClickCapture: ((e: MouseEvent) => void) | undefined
 
@@ -572,8 +671,13 @@ class MenuInjector {
       try {
         const btn = (e.target as HTMLElement | null)?.closest?.('button[aria-label]')
         const aria = btn?.getAttribute('aria-label') ?? ''
-        if (TRIGGER_ARIA_RE.test(aria)) {
-          this.lastTrigger = { el: btn as HTMLElement, aria, at: Date.now() }
+        if (!aria) return
+        // 会话行与工作区行菜单都含「归档会话」文案，只能靠触发钮归属区分
+        const isWorkspace = /^工作区/.test(aria) || /^Workspace actions for/i.test(aria)
+        const isSession = !isWorkspace
+          && (/操作$/.test(aria) || /^Actions for/i.test(aria) || /^Session actions for/i.test(aria) || /^会话/.test(aria))
+        if (isWorkspace || isSession) {
+          this.lastTrigger = { el: btn as HTMLElement, aria, at: Date.now(), isSession }
         }
       } catch { /* fail-soft */ }
     }
@@ -595,31 +699,50 @@ class MenuInjector {
 
   private scan(): void {
     try {
-      const menu = document.querySelector('[role=menu]')
-      if (!menu || menu.querySelector(`[${ITEM_FLAG}]`)) return
-      const items = Array.from(menu.querySelectorAll('[role=menuitem]'))
-      const labels = items.map((i) => i.textContent?.trim() ?? '')
-      const isSessionMenu = labels.some((l) => SESSION_MENU_ANCHORS.includes(l))
-      if (!isSessionMenu || items.length === 0) return
-      const last = items[items.length - 1]!
-      const wrap = last.parentElement
-      if (!wrap || !wrap.parentElement) return
-      const cloneWrap = wrap.cloneNode(false) as HTMLElement
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.setAttribute('role', 'menuitem')
-      btn.setAttribute(ITEM_FLAG, 'item')
-      btn.className = last.className
-      btn.textContent = '移交会话'
-      btn.addEventListener('click', () => {
-        this.closeMenu()
-        // 仅认 3 秒内的触发记录（防误配到上一次开菜单）
-        const trig = Date.now() - this.lastTrigger.at < 3000 ? this.lastTrigger : { at: 0 }
-        this.orchestrator.run({ el: trig.el, aria: trig.aria })
+      // 菜单关闭后残留的游离节点（portal 卸载不完全）先清掉
+      for (const stray of Array.from(document.querySelectorAll(`[${ITEM_FLAG}="item"]`))) {
+        if (!stray.closest('[role="menu"]')) stray.remove()
+      }
+      const trig = this.lastTrigger
+      if (!trig || trig.isSession !== true || Date.now() - trig.at > 5000) return
+      const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter((m) => {
+        const r = m.getBoundingClientRect()
+        return r.width > 0 && r.height > 0
       })
-      cloneWrap.append(btn)
-      wrap.parentElement.append(cloneWrap)
-      console.info('[session-handoff] menu: 已注入「移交会话」菜单项')
+      for (const menu of menus) {
+        if (menu.querySelector(`[${ITEM_FLAG}]`)) continue
+        const items = Array.from(menu.querySelectorAll('[role="menuitem"]')) as HTMLButtonElement[]
+        if (items.length === 0) continue
+        const last = items[items.length - 1]!
+        const wrap = last.parentElement
+        if (!wrap) continue
+        const cloneWrap = wrap.cloneNode(false) as HTMLElement
+        // 参照非危险项取样式：直接抄最后一项会继承「删除会话」的 danger 红
+        const refBtn = items.find((b) => !/_danger_/.test(String(b.className || ''))) ?? items[0]!
+        const refIcon = refBtn.querySelector('span')
+        const btn = document.createElement('button')
+        btn.type = 'button'
+        btn.setAttribute('role', 'menuitem')
+        btn.setAttribute(ITEM_FLAG, 'item')
+        btn.className = String(refBtn.className || '').replace(/_danger_\S*/g, '').replace(/\s+/g, ' ').trim()
+        const iconWrap = document.createElement('span')
+        if (refIcon?.className) iconWrap.className = refIcon.className
+        iconWrap.innerHTML = HANDOFF_ICON
+        btn.append(iconWrap, document.createTextNode('移交会话'))
+        btn.style.color = HANDOFF_COLOR
+        // 快照绑定：菜单常开超过 3 秒也不会丢掉 el/aria
+        const snap = { el: trig.el, aria: trig.aria, at: Date.now() }
+        btn.addEventListener('click', () => {
+          this.closeMenu()
+          this.orchestrator.run({ el: snap.el, aria: snap.aria })
+        })
+        cloneWrap.append(btn)
+        if (wrap === menu) menu.append(cloneWrap)
+        else wrap.after(cloneWrap)
+        console.info('[session-handoff] menu: 已注入「移交会话」labels='
+          + JSON.stringify(items.map((i) => (i.textContent ?? '').trim())) + ' trigger=' + trig.aria)
+        return
+      }
     } catch (e) {
       console.warn('[session-handoff] menu scan error', e)
     }
